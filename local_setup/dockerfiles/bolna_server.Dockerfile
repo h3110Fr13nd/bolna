@@ -1,5 +1,6 @@
 FROM python:3.10.13-slim
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=bind,source=./requirements.txt,target=/app/requirements.txt \
     --mount=type=bind,source=./pyproject.toml,target=/app/pyproject.toml \
