@@ -10,6 +10,8 @@ import io
 import wave
 import numpy as np
 import aiofiles
+import soxr
+import soundfile as sf
 from botocore.exceptions import BotoCoreError, ClientError
 from aiobotocore.session import AioSession
 from contextlib import AsyncExitStack
@@ -356,15 +358,16 @@ def convert_audio_to_wav(audio_bytes, source_format = 'flac'):
 
 
 def resample(audio_bytes, target_sample_rate, format="mp3"):
-    audio_buffer = io.BytesIO(audio_bytes)
-    audio_segment = AudioSegment.from_file(audio_buffer, format=format)
-    orig_sample_rate = audio_segment.frame_rate
-    if orig_sample_rate == target_sample_rate:
-        return audio_bytes
-    logger.info(f"Resampling from {orig_sample_rate} to {target_sample_rate}")
-    resampled_audio = audio_segment.set_frame_rate(target_sample_rate)
+    audio_data, orig_sample_rate = sf.read(io.BytesIO(audio_bytes), dtype="int16")
+    resampler = soxr.resample(audio_data, orig_sample_rate, target_sample_rate, "VHQ")
     audio_buffer = io.BytesIO()
-    resampled_audio.export(audio_buffer, format="wav")
+    audio_segment = AudioSegment(
+        data=resampler.tobytes(),
+        sample_width=2,
+        frame_rate=target_sample_rate,
+        channels=1
+    )
+    audio_segment.export(audio_buffer, format="wav")
     return audio_buffer.getvalue()
 
 
@@ -462,17 +465,12 @@ async def save_audio_file_to_s3(conversation_recording, sampling_rate=24000, ass
             gap_duration_samples = frame_start_time - last_frame_end_time
             silence = AudioSegment.silent(duration=gap_duration_samples * 1000, frame_rate=sampling_rate)
             combined_audio += silence
-        
         last_frame_end_time = frame_start_time + frame['duration']
         frame_as = AudioSegment.from_file(io.BytesIO(frame['data']), format="wav")
         combined_audio += frame_as
 
-    webm_segment = AudioSegment.from_file(io.BytesIO(conversation_recording['input']["data"]))
+    webm_segment = AudioSegment.from_file(io.BytesIO(conversation_recording['input']["data"]), format="webm")
     webm_segment = webm_segment.set_frame_rate(sampling_rate)
-    
-    wav_bytes = io.BytesIO()
-    webm_segment.export(wav_bytes, format="wav")
-    wav_bytes.seek(0)
 
     audio_segment_bytes = io.BytesIO()
     combined_audio = combined_audio.set_frame_rate(sampling_rate)
@@ -482,25 +480,13 @@ async def save_audio_file_to_s3(conversation_recording, sampling_rate=24000, ass
     combined_audio_segment = AudioSegment.from_file(audio_segment_bytes, format="wav")
     combined_audio_segment = combined_audio_segment.set_channels(1)
 
-    def audiosegment_to_numpy(segment):
-        samples = np.array(segment.get_array_of_samples())
-        return samples.astype(np.float32) / (2**15)
-    
-    webm_samples = audiosegment_to_numpy(webm_segment)
-    combined_samples = audiosegment_to_numpy(combined_audio_segment)
-
-    max_length = max(len(webm_samples), len(combined_samples))
-    webm_samples_padded = np.pad(webm_samples, (0, max_length - len(webm_samples)), mode='constant')
-    combined_samples_padded = np.pad(combined_samples, (0, max_length - len(combined_samples)), mode='constant')
-
-    stereo_samples = np.stack((webm_samples_padded, combined_samples_padded), axis=0)
-    stereo_audio_segment = AudioSegment(
-        stereo_samples.tobytes(),
-        frame_rate=sampling_rate,
-        sample_width=2,  # 16-bit PCM
-        channels=2
-    )
-    
+    if len(webm_segment) > len(combined_audio_segment):
+        combined_audio_segment = combined_audio_segment + AudioSegment.silent(duration=len(webm_segment) - len(combined_audio_segment))
+    elif len(webm_segment) < len(combined_audio_segment):
+        webm_segment = webm_segment + AudioSegment.silent(duration=len(combined_audio_segment) - len(webm_segment))
+    webm_segment = webm_segment.set_channels(1)
+    combined_audio_segment = combined_audio_segment.set_channels(1)
+    stereo_audio_segment = webm_segment.overlay(combined_audio_segment)
     audio_buffer = io.BytesIO()
     stereo_audio_segment.export(audio_buffer, format="wav")
     audio_buffer.seek(0)
@@ -508,7 +494,6 @@ async def save_audio_file_to_s3(conversation_recording, sampling_rate=24000, ass
     key = f'{assistant_id + run_id.split("#")[1]}.wav'
     logger.info(f"Storing in {RECORDING_BUCKET_URL}{key}")
     await store_file(bucket_name=RECORDING_BUCKET_NAME, file_key=key, file_data=audio_buffer, content_type="audio/wav")
-    
     return f'{RECORDING_BUCKET_URL}{key}'
 
 def list_number_of_wav_files_in_directory(directory):
